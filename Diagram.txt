@@ -1,0 +1,6 @@
++------------------+     +---------------------+     +-------------------------+
+| Local HTML/JS    | --> |  Local Python API   | --> |  Streamlink             |
+| Player           |     |  Flask (/api/resolve) |   |  Extracts HLS URLs      |
+| (360 or normal)  | <-- |  returns JSON       | <-- |  Returns qualities      |
++------------------+     +---------------------+     +-------------------------+
+
