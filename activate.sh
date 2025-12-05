@@ -3,7 +3,7 @@
 # Resolve directory of this script
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo "Activating ComfyUI virtual environment..."
+echo "Activating virtual environment..."
 
 # Point directly to the venv path inside the same folder as the script
 if [ ! -f "$SCRIPT_DIR/.360/bin/activate" ]; then
