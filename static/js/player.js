@@ -44,7 +44,7 @@
   const FOV_MIN = 40;
   const FOV_MAX = 120;
 
-  // Preview window state (bounded inside playerShell)
+  // Preview window state
   let previewEnabled = false;
   let previewX = 12;
   let previewY = 12;
@@ -57,43 +57,36 @@
   let borderEnabled = false;
   let borderColor = "#00e5ff";
 
-  // -------- Public API used by app.js / HTML onclick --------
+  // Optimization: Render Loop State
+  let rafId = 0;             // Tracks the pending render frame
+  let videoPumpId = null;    // Tracks the video frame callback loop
+
+  // -------- Public API --------
   window.playStream = function playStream(url) {
     const u = String(url || "");
     const isM3U8 = /\.m3u8(\?|#|$)/i.test(u);
 
-    // Ensure the video element can be used as a texture source
     video.crossOrigin = "anonymous";
 
-    // Cleanup existing hls instance
     if (hls) {
       try { hls.destroy(); } catch (_) {}
       hls = null;
     }
 
-    // Reset video
     try { video.pause(); } catch (_) {}
     video.removeAttribute("src");
     video.load();
 
-    // Prefer hls.js when available
     if (isM3U8 && window.Hls && window.Hls.isSupported()) {
       hls = new window.Hls({ enableWorker: true });
       hls.loadSource(u);
       hls.attachMedia(video);
-
       hls.on(window.Hls.Events.MANIFEST_PARSED, () => {
         video.play().catch(err => console.warn("play() failed:", err));
       });
-
-      hls.on(window.Hls.Events.ERROR, (_evt, data) => {
-        console.warn("HLS error:", data);
-      });
-
       return;
     }
 
-    // Native HLS (Safari) or normal mp4/webm
     video.src = u;
     video.play().catch(err => console.warn("play() failed:", err));
   };
@@ -121,6 +114,7 @@
     lon += dxLon;
     lat += dyLat;
     lat = clamp(lat, -85, 85);
+    invalidate(); // Trigger a single render
   };
 
   window.resetView = function resetView() {
@@ -164,8 +158,7 @@
     }
     applyPreviewPresetInternal(which);
   };
-  
-    // Expose mode check for shortcuts
+
   window.__playerInternal = {
     is360: () => mode === "360"
   };
@@ -179,6 +172,22 @@
     borderColor = previewBorderColor.value || "#00e5ff";
     applyBorder();
 
+    // Resize Observer handles layout changes
+    const ro = new ResizeObserver(() => {
+      if (renderer && camera) resizeThree();
+      if (mode === "360" && previewEnabled) clampPreviewToBounds();
+      invalidate();
+    });
+    ro.observe(playerShell);
+
+    // Event Listeners
+    canvas.addEventListener("pointerdown", onCanvasPointerDown);
+    canvas.addEventListener("wheel", onCanvasWheel, { passive: false });
+
+    previewDragBar.addEventListener("pointerdown", onPreviewDragDown);
+    previewResizeHandle.addEventListener("pointerdown", onPreviewResizeDown);
+
+    // Video Lifecycle for Optimization
     video.addEventListener("loadedmetadata", () => {
       updatePreviewAspect();
       if (mode === "360" && previewEnabled) {
@@ -186,23 +195,79 @@
         clampPreviewToBounds();
         applyPreviewGeometry();
       }
+      invalidate();
     });
 
-    canvas.addEventListener("pointerdown", onCanvasPointerDown);
-    canvas.addEventListener("wheel", onCanvasWheel, { passive: true });
+    // Start/Stop the render loop based on playback
+    video.addEventListener("play", startVideoPump);
+    video.addEventListener("pause", stopVideoPump);
+    video.addEventListener("ended", stopVideoPump);
+    video.addEventListener("seeked", invalidate); // Render one frame after seek
 
-    previewDragBar.addEventListener("pointerdown", onPreviewDragDown);
-    previewResizeHandle.addEventListener("pointerdown", onPreviewResizeDown);
-
-    const ro = new ResizeObserver(() => {
-      if (renderer && camera) resizeThree();
-      if (mode === "360" && previewEnabled) clampPreviewToBounds();
-    });
-    ro.observe(playerShell);
-
-    requestAnimationFrame(animate);
     setMode("normal");
   }
+
+  // -------- Rendering Optimization (The Fix) --------
+
+  // 1. Only schedule a render if one isn't already pending
+  function invalidate() {
+    if (mode === "360" && !rafId) {
+      rafId = requestAnimationFrame(renderFrame);
+    }
+  }
+
+  // 2. The actual render function (runs once per request)
+  function renderFrame() {
+    rafId = 0; // Reset flag so next invalidate() can schedule
+    if (mode !== "360" || !renderer || !scene || !camera) return;
+
+    lat = clamp(lat, -85, 85);
+    const phi = THREE.MathUtils.degToRad(90 - lat);
+    const theta = THREE.MathUtils.degToRad(lon);
+
+    camera.target.x = radius * Math.sin(phi) * Math.cos(theta);
+    camera.target.y = radius * Math.cos(phi);
+    camera.target.z = radius * Math.sin(phi) * Math.sin(theta);
+
+    camera.lookAt(camera.target);
+    renderer.render(scene, camera);
+  }
+
+  // 3. Sync rendering to video framerate (video pump)
+  function startVideoPump() {
+    if (videoPumpId) return; // Already running
+
+    if ("requestVideoFrameCallback" in video) {
+      // Modern browsers: Sync exactly to video FPS
+      const onFrame = () => {
+        if (video.paused || video.ended) return; // Stop if done
+        invalidate(); // Trigger 3D render
+        video.requestVideoFrameCallback(onFrame);
+      };
+      video.requestVideoFrameCallback(onFrame);
+      videoPumpId = true; // Just a flag to say it's active
+    } else {
+      // Fallback: Standard loop, but only when playing
+      const tick = () => {
+        if (video.paused || video.ended) {
+          videoPumpId = null;
+          return;
+        }
+        invalidate();
+        videoPumpId = requestAnimationFrame(tick);
+      };
+      videoPumpId = requestAnimationFrame(tick);
+    }
+  }
+
+  function stopVideoPump() {
+    // For the fallback loop
+    if (typeof videoPumpId === 'number') {
+      cancelAnimationFrame(videoPumpId);
+    }
+    videoPumpId = null;
+  }
+
 
   function setMode(next) {
     mode = next;
@@ -218,8 +283,14 @@
       previewEnabled = false;
       hidePreviewSurfaceButKeepVideoAlive();
       setPreviewOpacity(parseInt(previewOpacity.value || "85", 10));
+      
+      // If video is already playing, ensure pump is running
+      if (!video.paused && !video.ended) startVideoPump();
+      invalidate(); 
     } else {
       showNormalVideoSurface();
+      // Stop rendering loop to save CPU
+      if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
     }
   }
 
@@ -227,7 +298,8 @@
     if (renderer && scene && camera) return;
 
     renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
-    renderer.setPixelRatio(window.devicePixelRatio || 1);
+    // Cap pixel ratio to save GPU on high-res screens
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
 
     if ("outputColorSpace" in renderer) renderer.outputColorSpace = THREE.SRGBColorSpace;
 
@@ -235,7 +307,7 @@
     camera = new THREE.PerspectiveCamera(fov, 16 / 9, 0.1, 1100);
     camera.target = new THREE.Vector3(0, 0, 0);
 
-    const geom = new THREE.SphereGeometry(radius, 64, 40);
+    const geom = new THREE.SphereGeometry(radius, 48, 32);
     geom.scale(-1, 1, 1);
 
     videoTexture = new THREE.VideoTexture(video);
@@ -256,22 +328,7 @@
     renderer.setSize(w, h, false);
     camera.aspect = w / h;
     camera.updateProjectionMatrix();
-  }
-
-  function animate() {
-    requestAnimationFrame(animate);
-    if (mode !== "360" || !renderer || !scene || !camera) return;
-
-    lat = clamp(lat, -85, 85);
-    const phi = THREE.MathUtils.degToRad(90 - lat);
-    const theta = THREE.MathUtils.degToRad(lon);
-
-    camera.target.x = radius * Math.sin(phi) * Math.cos(theta);
-    camera.target.y = radius * Math.cos(phi);
-    camera.target.z = radius * Math.sin(phi) * Math.sin(theta);
-
-    camera.lookAt(camera.target);
-    renderer.render(scene, camera);
+    invalidate();
   }
 
   // -------- 360 interaction --------
@@ -283,6 +340,7 @@
     onDownLon = lon;
     onDownLat = lat;
 
+    canvas.setPointerCapture(e.pointerId); // Better tracking
     window.addEventListener("pointermove", onCanvasPointerMove);
     window.addEventListener("pointerup", onCanvasPointerUp);
     e.preventDefault();
@@ -296,11 +354,14 @@
     lon = onDownLon - dx * 0.12;
     lat = onDownLat + dy * 0.12;
     lat = clamp(lat, -85, 85);
+    
+    invalidate(); // Update view
     e.preventDefault();
   }
 
   function onCanvasPointerUp(e) {
     isUserInteracting = false;
+    canvas.releasePointerCapture(e.pointerId);
     window.removeEventListener("pointermove", onCanvasPointerMove);
     window.removeEventListener("pointerup", onCanvasPointerUp);
     e.preventDefault();
@@ -308,6 +369,7 @@
 
   function onCanvasWheel(e) {
     if (mode !== "360") return;
+    e.preventDefault(); // Prevent page scroll
     setFov(fov + (e.deltaY || 0) * 0.02);
   }
 
@@ -319,6 +381,7 @@
     }
     fovSlider.value = String(Math.round(fov));
     fovValue.textContent = String(Math.round(fov));
+    invalidate();
   }
 
   // -------- Preview window logic --------
@@ -500,4 +563,3 @@
 
   init();
 })();
-
